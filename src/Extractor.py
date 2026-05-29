@@ -1,136 +1,264 @@
-class Extractor :
+import os
+import re
 
-    def _clean_ocr_matches(matches):
-        """nettoyer la ponctuation et les espaces des codes trouvés."""
-        return [re.sub(r'[\s\n\r\-\/\.]', '', m) for m in matches]
+from Config import Config
+from utils.ImageUtils import ImageLoader, ImagePreprocessor, ImageTransformer
+from utils.TextUtils import TextProcessor, TextExtractor
 
-    def process_image(image_path, expected_ref_code, ocr_engine, threshold_decor=0.8, show_image=False):
-        try:
-            # --- 1. EXTRACTION OCR INITIALE (Scan complet) ---
-            ocr_results, total_height = ocr_engine.extract_data(image_path)
-            limit_y = total_height * threshold_decor
-            
-            # Séparation Décor / Cartouche basée sur la position Y
-            decor_items = [item for item in ocr_results if item['y'] < limit_y]
-            cartouche_items = [item for item in ocr_results if item['y'] >= limit_y]
-            
-            # Concaténation en majuscules pour la recherche
-            decor_full_text = " ".join([item['text'].upper() for item in decor_items])
-            cartouche_full_text = " ".join([item['text'].upper() for item in cartouche_items])
-            
-            print(f"[DEBUG] Texte Décor : {decor_full_text}")
-            print(f"[DEBUG] Texte Cartouche : {cartouche_full_text}")
+class Extractor:
+    """
+    Brique 1 - Extraction (perimetre recadre).
+    Detecte le texte d'une image rasterisee via un moteur OCR puis y recherche
+    les codes (code article et GENCOD). Aucune validation metier ni comparaison
+    au referentiel n'est realisee ici : ces briques relevent de la phase 2.
+    """
 
-            decor_matches = []
-            cartouche_matches = []
-            full_ref_pattern = get_flexible_regex(expected_ref_code)
+    def __init__(self, engine, barcode_engine, config=Config, plotter=None):
+        """
+        :param engine: instance de moteur OCR (sous-classe de OCREngine)
+        :param config: classe de configuration (regles, rotations)
+        :param barcode_engine: moteur de codes-barres (OpenCVBarcodeEngine par defaut)
+        :param plotter: visualiseur optionnel des zones detectees (None = desactive)
+        """
+        self.engine = engine
+        self.config = config
+        self.barcode_engine = barcode_engine 
+        self.plotter = plotter
 
-            # --- 2. RECHERCHE DANS LE CARTOUCHE ---
-            cartouche_raw_matches = re.findall(full_ref_pattern, cartouche_full_text)
-            if cartouche_raw_matches:
-                cartouche_matches.extend(_clean_ocr_matches(cartouche_raw_matches))
+    def extract(self, image_path):
+        """
+        Extrait le texte et les codes d'une image.
+        :param image_path: chemin de l'image rasterisee a traiter
+        :return: dictionnaire de resultats d'extraction
+        """
+        filename = os.path.basename(image_path)
+        expected_code = TextExtractor.extract_expected_code_from_filename(filename)
 
-            # --- 3. RECHERCHE DANS LE DECOR ---
-            decor_raw_matches = re.findall(full_ref_pattern, decor_full_text)
-            if decor_raw_matches:
-                decor_matches.extend(_clean_ocr_matches(decor_raw_matches))
-            else:
-                # Tentative code contracté (4 chiffres) si rien trouvé en 8 chiffres
-                contracted_val = search_contracted_code(decor_full_text, expected_ref_code)
-                if contracted_val:
-                    decor_matches.append(contracted_val)
+        image = ImageLoader.load(image_path)
 
-            # --- 4. GESTION DE L'AFFICHAGE VISUEL ---
-            if show_image and (decor_matches or cartouche_matches):
-                visual_hits = []
-                
-                # Position approximative pour les hits du décor
-                for match in decor_matches:
-                    y_pos = next((item['y'] for item in decor_items if match[:4] in item['text'].replace(' ', '')), limit_y / 2)
-                    visual_hits.append({'text': f"CODE DECOR: {match}", 'y': y_pos})
-                    
-                # Position approximative pour les hits du cartouche
-                for match in cartouche_matches:
-                    y_pos = next((item['y'] for item in cartouche_items if match[:4] in item['text'].replace(' ', '')), limit_y + 50)
-                    visual_hits.append({'text': f"CODE CART: {match}", 'y': y_pos})
+        # Détection des codes-barres :
+        barcode_detections = self.barcode_engine.read(image)
+        # Niveau de gris si spécifié
+        ocr_image = ImagePreprocessor.to_grayscale(image) if self.config.USE_GRAYSCALE else image
 
-                show_hits_on_image(ocr_engine.img, visual_hits, limit_y)
+        # OCR a 0 degre, recherche par zone (decor / cartouche).
+        full_text, mean_conf, detections = self._run_ocr(ocr_image)
+        limit_y = ocr_image.size[1] * self.config.CARTOUCHE_Y_RATIO
+        decor, cartouche = self._split_zones(detections, limit_y)
+        article_codes = {
+            # Dans le decor, on replie sur le code contracte (4 chiffres) si besoin.
+            "packaging": self._find_in_zone(decor, expected_code, allow_contracted=True) if expected_code else {},
+            "cartouche": self._find_in_zone(cartouche, expected_code, allow_contracted=False) if expected_code else {},
+        }
+        detected_angles = [0] if self._has_codes(article_codes) else []
 
-            # --- 5. VALIDATION METIER ---
-            all_matches = decor_matches + cartouche_matches
-            total_count = len(all_matches)
+        # Localisations (polygones) en 0 degre, pour la visualisation.
+        code_locations = []
+        code_locations += self._locate(article_codes["packaging"], decor, "PACKAGING", 0, None, None)
+        code_locations += self._locate(article_codes["cartouche"], cartouche, "CARTOUCHE", 0, None, None)
 
-            if total_count == 0:
-                return {"success": False, "error": "ERR_NOT_FOUND", "message": "Code absent.", "matches": [], "count": 0}
-            
-            if cartouche_matches and not decor_matches:
-                return {"success": False, "error": "ERR_MISSING_DECOR", "message": "Absent du décor packaging.", "matches": all_matches, "count": total_count}
+        # Rotation + merge : on retente l'OCR sur chaque angle, on fusionne les codes
+        # trouves dans le packaging et on reprojette leur position sur l'image 0 degre.
+        if self.config.TRY_ROTATIONS and expected_code:
+            for angle in self.config.ROTATION_ANGLES:
+                rotated = ImageTransformer.rotate(ocr_image, angle)
+                _, _, rotated_detections = self._run_ocr(rotated)
+                found = self._find_in_zone(rotated_detections, expected_code, allow_contracted=True)
+                if found:
+                    article_codes["packaging"] = self._merge_codes(article_codes["packaging"], found)
+                    detected_angles.append(angle)
+                    code_locations += self._locate(found, rotated_detections, "PACKAGING",
+                                                   angle, ocr_image.size, rotated.size)
 
-            if decor_matches and not cartouche_matches:
-                return {"success": False, "error": "ERR_MISSING_CARTOUCHE", "message": "Absent du cartouche technique.", "matches": all_matches, "count": total_count}
+        result = {
+            "file": filename,
+            "engine": self.engine.__class__.__name__,
+            "expected_code": expected_code,
+            "detected_angles": detected_angles,
+            "mean_confidence": round(mean_conf, 3),
+            "n_text_detections": len(detections),
+            "article_codes": article_codes,
+            "barcodes": [{"value": b["value"], "confidence": b["confidence"]} for b in barcode_detections],
+            "full_text": full_text,
+        }
 
-            return {"success": True, "error": None, "message": f"Validation réussie : {len(decor_matches)} décor, {len(cartouche_matches)} cartouche.", "matches": all_matches, "count": total_count}
+        # Visualisation : une seule image (0 degre) avec les codes localises + leur angle.
+        if self.plotter is not None:
+            result["annotated_image"] = self.plotter.annotate(
+                ocr_image, code_locations, barcode_detections, limit_y, filename
+            )
 
-        except Exception as e:
-            return {"success": False, "error": "ERR_SYSTEM", "message": str(e), "matches": [], "count": 0}
-        
+        return result
 
-    def main_extraction(engine, show_image=False):
-        print("[INFO] Lancement du POC OCR - Vérification des codes packaging")
-        print(f"[INFO] Utilisation du moteur OCR : {engine.__class__.__name__}")
-        print("-" * 60)
-        
-        for doc_type in tqdm(os.listdir(BASE_DIR), desc="Traitement des types de documents"):
-            doc_path = os.path.join(BASE_DIR, doc_type)
-            if not os.path.isdir(doc_path):
+    def _run_ocr(self, image):
+        """
+        Lance l'OCR sur une image et agrege les detections.
+        :param image: image PIL a analyser
+        :return: tuple (texte_complet, confiance_moyenne, liste_detections)
+        """
+        detections = self.engine.extract_data(image)
+        full_text = " ".join(d["text"] for d in detections)
+        if detections:
+            mean_conf = sum(d["confidence"] for d in detections) / len(detections)
+        else:
+            mean_conf = 0.0
+        return full_text, mean_conf, detections
+
+    def _split_zones(self, detections, limit_y):
+        """
+        Separe les detections OCR entre le decor (haut) et la cartouche (bas).
+        :param detections: detections OCR [{"text","box"}]
+        :param limit_y: ordonnee separant le decor (haut) de la cartouche (bas)
+        :return: tuple (detections_decor, detections_cartouche)
+        """
+        decor = [d for d in detections if self._box_center_y(d) < limit_y]
+        cartouche = [d for d in detections if self._box_center_y(d) >= limit_y]
+        return decor, cartouche
+
+    def _locate(self, codes, zone_detections, zone, angle, original_size, rotated_size):
+        """
+        Construit les localisations des codes d'une zone, sous forme de polygones
+        exprimes dans l'image d'origine (0 degre). Pour un angle non nul, les boites
+        trouvees sur l'image tournee sont reprojetees vers l'image d'origine.
+        :param codes: codes detectes {base: {"occurrences","complement",...}}
+        :param zone_detections: detections OCR de la passe concernee
+        :param zone: libelle de zone ('PACKAGING' ou 'CARTOUCHE')
+        :param angle: angle de la passe (0 pour l'image d'origine)
+        :param original_size: taille (w, h) de l'image d'origine (None si angle 0)
+        :param rotated_size: taille (w, h) de l'image tournee (None si angle 0)
+        :return: liste de {"reference","zone","angle","occurrences","polygon"}
+        """
+        locations = []
+        for base, info in codes.items():
+            reference = base + (f"/{info['complement']}" if info["complement"] else "")
+            common = {"reference": reference, "zone": zone, "angle": angle,
+                      "occurrences": info["occurrences"]}
+            boxes = self._match_boxes(zone_detections, base + info["complement"])
+            if not boxes:
+                locations.append({**common, "polygon": None})
                 continue
-            
-            for res_folder in RESOLUTIONS:
-                folder_path = os.path.join(doc_path, res_folder)
-                if not os.path.exists(folder_path):
-                    continue
-                    
-                for filename in os.listdir(folder_path):
-                    if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        continue
-                        
-                    image_path = os.path.join(folder_path, filename)
-                    expected_ref = extract_expected_code_from_filename(filename)
-                    
-                    if not expected_ref:
-                        continue
+            for box in boxes:
+                if angle == 0:
+                    x, y, w, h = box
+                    polygon = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+                else:
+                    polygon = ImageTransformer.rotate_box_back(box, angle, original_size, rotated_size)
+                locations.append({**common, "polygon": polygon})
+        return locations
 
-                    print(f"\nFichier : {filename} | Attendu : {expected_ref}")
-                    
-                    result = process_image(image_path, expected_ref, engine, threshold_decor=THRESHOLD_DECOR, show_image=show_image)
-                    
-                    # FALLBACK : 8 ROTATIONS 
-                    if not result['success']:
-                        print(f"[RETRY] Code non trouvé à 0°. Tentative de rotation forcée...")
-                        # On teste 45, 90, 135, 180, 225, 270, 315
-                        angles = [90, 180, 270, 45, 135, 225, 315] 
-                        
-                        for angle in angles:
-                            print(f"  -> Test rotation {angle}°...")
-                            with Image.open(image_path) as img:
-                                # expand=True pour ne pas couper les coins lors de la rotation
-                                rotated_img = img.rotate(angle, expand=True)
-                                temp_path = f"temp_rot_{angle}.png"
-                                rotated_img.save(temp_path)
-                            
-                            result = process_image(temp_path, expected_ref, engine, threshold_decor=THRESHOLD_DECOR, show_image=show_image)
-                            
-                            if os.path.exists(temp_path):
-                                os.remove(temp_path)
-                                
-                            if result['success']:
-                                print(f"  [SUCCESS] Code trouvé après rotation de {angle}° !")
-                                break 
-                    
-                    status = "OK" if result['success'] else "FAIL"
-                    print(f"Résultat final : {status} | {result['message']}")
-                    if 'matches' in result:
-                        print(f"  Codes validés : {result['matches']}")
-                    
-        print("-" * 60)
-        print("[INFO] Fin du traitement.")
+    @staticmethod
+    def _match_boxes(detections, reference_digits):
+        """
+        Retrouve les boites des mots OCR qui composent un code.
+        :param detections: detections OCR [{"text","box"}]
+        :param reference_digits: chiffres de la reference (base + complement)
+        :return: liste de boites (x, y, w, h)
+        """
+        boxes = []
+        for det in detections:
+            box = det.get("box")
+            if not box:
+                continue
+            digits = "".join(c for c in det["text"] if c.isdigit())
+            # Un mot compose le code si ses chiffres (au moins 3) en font partie.
+            if len(digits) >= 3 and digits in reference_digits:
+                boxes.append(box)
+        return boxes
+
+    def _find_in_zone(self, zone_detections, expected_code, allow_contracted):
+        """
+        Recherche le code article dans une zone (decor ou cartouche).
+        Un code plus long que la base est decoupe en base + complement
+        (cas du code avec slash, ex: '76059533529' -> '76059533' + '529').
+        :param zone_detections: detections OCR de la zone
+        :param expected_code: code attendu issu du nom de fichier
+        :param allow_contracted: autoriser le repli sur le code contracte (4 chiffres)
+        :return: dictionnaire {code_base: {"occurrences": int, "complement": str, "confidence": float}}
+        """
+        normalized = TextProcessor.to_upper(" ".join(d["text"] for d in zone_detections))
+        pattern = TextExtractor.get_flexible_regex(expected_code)
+        matches = TextExtractor.clean_matches(re.findall(pattern, normalized))
+
+        if not matches:
+            if allow_contracted:
+                contracted = TextExtractor.search_contracted_code(normalized, expected_code)
+                if contracted:
+                    confidence = self._code_confidence(contracted, zone_detections)
+                    return {contracted: {"occurrences": 1, "complement": "", "confidence": confidence}}
+            return {}
+
+        # La base fait la longueur du code attendu (76 + 6 chiffres = 8) ;
+        # les chiffres en plus sont le complement (le "reste" du code coupe / slash).
+        base_length = len(expected_code)
+        codes = {}
+        for match in matches:
+            base, complement = match[:base_length], match[base_length:]
+            entry = codes.setdefault(base, {"occurrences": 0, "complement": "", "confidence": None})
+            entry["occurrences"] += 1
+            if complement and not entry["complement"]:
+                entry["complement"] = complement
+
+        for base, entry in codes.items():
+            entry["confidence"] = self._code_confidence(base, zone_detections)
+        return codes
+
+    @staticmethod
+    def _merge_codes(accumulator, new_codes):
+        """
+        Fusionne des codes detectes (issus d'une rotation) dans un accumulateur.
+        Occurrences = max entre passes (evite de gonfler en relisant le meme code) ;
+        confiance = max ; complement = premier non vide.
+        :param accumulator: dictionnaire des codes deja accumules
+        :param new_codes: dictionnaire des codes a fusionner
+        :return: l'accumulateur mis a jour
+        """
+        for base, info in new_codes.items():
+            if base not in accumulator:
+                accumulator[base] = dict(info)
+                continue
+            target = accumulator[base]
+            target["occurrences"] = max(target["occurrences"], info["occurrences"])
+            if info["complement"] and not target["complement"]:
+                target["complement"] = info["complement"]
+            confidences = [c for c in (target["confidence"], info["confidence"]) if c is not None]
+            target["confidence"] = max(confidences) if confidences else None
+        return accumulator
+
+    @staticmethod
+    def _has_codes(article_codes):
+        """
+        Indique si au moins un code a ete detecte (decor ou cartouche).
+        :param article_codes: dictionnaire {"packaging": {...}, "cartouche": {...}}
+        :return: booleen
+        """
+        return bool(article_codes["packaging"] or article_codes["cartouche"])
+
+    @staticmethod
+    def _box_center_y(detection):
+        """
+        Renvoie l'ordonnee du centre de la boite d'une detection (0 si absente).
+        :param detection: detection OCR {"box": (x, y, w, h)}
+        :return: ordonnee du centre de la boite
+        """
+        box = detection.get("box")
+        if not box:
+            return 0
+        return box[1] + box[3] / 2
+
+    @staticmethod
+    def _code_confidence(code, detections):
+        """
+        Estime la confiance d'un code a partir des mots OCR qui le composent.
+        :param code: code (base ou contracte) recherche
+        :param detections: detections OCR [{"text","confidence",...}]
+        :return: confiance moyenne (0-1) des mots correspondants, ou None
+        """
+        confidences = []
+        for det in detections:
+            digits = "".join(c for c in det["text"] if c.isdigit())
+            # Un mot contribue si ses chiffres (au moins 2) font partie du code.
+            if len(digits) >= 2 and digits in code:
+                confidences.append(det["confidence"])
+        if not confidences:
+            return None
+        return round(sum(confidences) / len(confidences), 3)

@@ -1,4 +1,23 @@
+# Environnement
 /.venv
+.env
+
+# Donnees et ressources non versionnees
 /data
 /infos
-.env
+
+# Sorties generees
+/output
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Fichiers temporaires (rotations, crops)
+temp_*.png
+
+# OS
+.DS_Store
+Thumbs.db
