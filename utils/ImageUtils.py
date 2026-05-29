@@ -1,21 +1,21 @@
 from PIL import Image
-import cv2
-from sympy import re
 
-class ImageUtils():
-
+class ImageLoader():
     @staticmethod
     def load_image(image_path, preprocess_func=None):
         with Image.open(image_path) as img:
             if preprocess_func:
                 img = preprocess_func(img)
             return img.copy()
-        
+    
+class ImagePreprocessor:
     @staticmethod
     def preprocess_image_to_grayscale(image):
         image = image.convert('L')
         return image
     
+
+class ImageTransformation:
     @staticmethod
     def prepare_crops(image_path):
         """Découpe l'image en deux zones (Haut/Bas) pour doubler la résolution perçue."""
