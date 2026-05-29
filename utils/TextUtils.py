@@ -41,15 +41,17 @@ class TextExtractor:
     @staticmethod
     def extract_expected_code_from_filename(filename):
         """
-        Extrait le code attendu depuis le nom du fichier.
-        Ex: '241449-01_76059715_BARQ...' -> Retourne '76059715'
+        Extrait le code attendu (76 + 6 chiffres) depuis le nom du fichier,
+        quelle que soit sa position dans le nom.
+        Ex: '241449-01_76059715_BARQ...' -> '76059715'
+        Ex: '76064923_BTE_PRIV_LABEL...'  -> '76064923'
         :param filename: nom du fichier image
         :return: code attendu (str) ou None
         """
-        parts = filename.split('_')
-        if len(parts) >= 2:
-            return parts[1]
-        return None
+        # On utilise des lookarounds plutot que \b car l'underscore (frequent dans
+        # les noms de fichier) est considere comme un caractere de mot par \b.
+        match = re.search(r"(?<!\d)76\d{6}(?!\d)", filename)
+        return match.group(0) if match else None
 
     @staticmethod
     def search_contracted_code(text, expected_ref_code):

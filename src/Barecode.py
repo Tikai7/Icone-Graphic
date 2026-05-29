@@ -68,10 +68,13 @@ class PyzbarBarcodeEngine(BarcodeEngine):
             if not r.data:
                 continue
             points = [(p.x, p.y) for p in r.polygon]
-            # 'quality' = indice de fiabilite
+            # zbar fournit 'quality' (entier non borne, plus c'est haut mieux c'est) :
+            # ~100+ = lecture tres fiable. On normalise sur 0-1 (cap a 100) pour rester
+            # sur la meme echelle que la confiance OCR du code article.
+            confidence = round(min(r.quality / 100.0, 1.0), 3)
             detections.append({
                 "value": r.data.decode("utf-8"),
                 "points": points,
-                "confidence": r.quality,
+                "confidence": confidence,
             })
         return detections

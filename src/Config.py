@@ -36,12 +36,10 @@ class Config:
     SAVE_ANNOTATED_IMAGES = True
 
     # --- Rotation
-    # Si aucun code article n'est detecte a 0 degre, on retente l'OCR sur 16 autres rotations
+    # Nombre d'orientations testees (0 degre inclus), reparties uniformement.
+    # Ex: 8 -> 0, 45, 90, 135, 180, 225, 270, 315 ; 16 -> pas de 22.5 degres.
+    # Surcharger au lancement via --rotations N.
     TRY_ROTATIONS = True
-    ROTATION_ANGLES = [
-        90, 180, 270,
-        45, 135, 225, 315,
-        22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5,
-    ]
+    ROTATION_STEPS = 16
     # Dossier de sortie 
     OUTPUT_DIR = "output"

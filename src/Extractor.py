@@ -13,17 +13,19 @@ class Extractor:
     au referentiel n'est realisee ici : ces briques relevent de la phase 2.
     """
 
-    def __init__(self, engine, barcode_engine, config=Config, plotter=None):
+    def __init__(self, engine, barcode_engine, config=Config, plotter=None, rotation_steps=None):
         """
         :param engine: instance de moteur OCR (sous-classe de OCREngine)
+        :param barcode_engine: moteur de codes-barres
         :param config: classe de configuration (regles, rotations)
-        :param barcode_engine: moteur de codes-barres (OpenCVBarcodeEngine par defaut)
         :param plotter: visualiseur optionnel des zones detectees (None = desactive)
+        :param rotation_steps: nombre d'orientations testees (defaut: Config.ROTATION_STEPS)
         """
         self.engine = engine
         self.config = config
-        self.barcode_engine = barcode_engine 
+        self.barcode_engine = barcode_engine
         self.plotter = plotter
+        self.rotation_steps = rotation_steps if rotation_steps is not None else config.ROTATION_STEPS
 
     def extract(self, image_path):
         """
@@ -35,40 +37,55 @@ class Extractor:
         expected_code = TextExtractor.extract_expected_code_from_filename(filename)
 
         image = ImageLoader.load(image_path)
-
-        # Détection des codes-barres :
-        barcode_detections = self.barcode_engine.read(image)
-        # Niveau de gris si spécifié
+        # Conversion en niveaux de gris optionnelle (desactivee par defaut).
         ocr_image = ImagePreprocessor.to_grayscale(image) if self.config.USE_GRAYSCALE else image
-
-        # OCR a 0 degre, recherche par zone (decor / cartouche).
-        full_text, mean_conf, detections = self._run_ocr(ocr_image)
         limit_y = ocr_image.size[1] * self.config.CARTOUCHE_Y_RATIO
-        decor, cartouche = self._split_zones(detections, limit_y)
-        article_codes = {
-            # Dans le decor, on replie sur le code contracte (4 chiffres) si besoin.
-            "packaging": self._find_in_zone(decor, expected_code, allow_contracted=True) if expected_code else {},
-            "cartouche": self._find_in_zone(cartouche, expected_code, allow_contracted=False) if expected_code else {},
-        }
-        detected_angles = [0] if self._has_codes(article_codes) else []
 
-        # Localisations (polygones) en 0 degre, pour la visualisation.
+        article_codes = {"packaging": {}, "cartouche": {}}
+        barcodes = []
         code_locations = []
-        code_locations += self._locate(article_codes["packaging"], decor, "PACKAGING", 0, None, None)
-        code_locations += self._locate(article_codes["cartouche"], cartouche, "CARTOUCHE", 0, None, None)
+        detected_angles = []
+        full_text, mean_conf, n_detections = "", 0.0, 0
 
-        # Rotation + merge : on retente l'OCR sur chaque angle, on fusionne les codes
-        # trouves dans le packaging et on reprojette leur position sur l'image 0 degre.
-        if self.config.TRY_ROTATIONS and expected_code:
-            for angle in self.config.ROTATION_ANGLES:
-                rotated = ImageTransformer.rotate(ocr_image, angle)
-                _, _, rotated_detections = self._run_ocr(rotated)
-                found = self._find_in_zone(rotated_detections, expected_code, allow_contracted=True)
+        # On teste 0 degre puis les rotations (reparties uniformement sur 360),
+        # et on s'arrete des que le code packaging ET le code-barres sont trouves.
+        angles = self._rotation_angles(self.rotation_steps) if self.config.TRY_ROTATIONS else [0]
+        for angle in angles:
+            rotated = ocr_image if angle == 0 else ImageTransformer.rotate(ocr_image, angle)
+
+            # --- Code article (OCR) ---
+            text, conf, detections = self._run_ocr(rotated)
+            if angle == 0:
+                # Passe de reference : on garde le texte/confiance et on separe les zones.
+                full_text, mean_conf, n_detections = text, conf, len(detections)
+                decor, cartouche = self._split_zones(detections, limit_y)
+                packaging = self._find_in_zone(decor, expected_code, allow_contracted=True) if expected_code else {}
+                cartouche_codes = self._find_in_zone(cartouche, expected_code, allow_contracted=False) if expected_code else {}
+                article_codes["packaging"] = self._merge_codes(article_codes["packaging"], packaging)
+                article_codes["cartouche"] = self._merge_codes(article_codes["cartouche"], cartouche_codes)
+                code_locations += self._locate(packaging, decor, "PACKAGING", 0, None, None)
+                code_locations += self._locate(cartouche_codes, cartouche, "CARTOUCHE", 0, None, None)
+                if packaging or cartouche_codes:
+                    detected_angles.append(0)
+            elif expected_code:
+                found = self._find_in_zone(detections, expected_code, allow_contracted=True)
                 if found:
                     article_codes["packaging"] = self._merge_codes(article_codes["packaging"], found)
+                    code_locations += self._locate(found, detections, "PACKAGING", angle,
+                                                   ocr_image.size, rotated.size)
                     detected_angles.append(angle)
-                    code_locations += self._locate(found, rotated_detections, "PACKAGING",
-                                                   angle, ocr_image.size, rotated.size)
+
+            # --- Code-barres (bibliotheque), tant qu'on ne l'a pas encore trouve ---
+            if not barcodes:
+                found_barcodes = self.barcode_engine.read(rotated)
+                if found_barcodes:
+                    barcodes = self._reproject_barcodes(found_barcodes, angle, ocr_image.size, rotated.size)
+
+            # --- Arret des que les deux cibles prioritaires sont trouvees :
+            # le code PACKAGING (decor) et le code-barres. Le code cartouche seul
+            # (toujours present, ce n'est pas la priorite) ne suffit pas a arreter.
+            if article_codes["packaging"] and barcodes:
+                break
 
         result = {
             "file": filename,
@@ -76,19 +93,29 @@ class Extractor:
             "expected_code": expected_code,
             "detected_angles": detected_angles,
             "mean_confidence": round(mean_conf, 3),
-            "n_text_detections": len(detections),
+            "n_text_detections": n_detections,
             "article_codes": article_codes,
-            "barcodes": [{"value": b["value"], "confidence": b["confidence"]} for b in barcode_detections],
+            "barcodes": [{"value": b["value"], "confidence": b["confidence"]} for b in barcodes],
             "full_text": full_text,
         }
 
         # Visualisation : une seule image (0 degre) avec les codes localises + leur angle.
         if self.plotter is not None:
             result["annotated_image"] = self.plotter.annotate(
-                ocr_image, code_locations, barcode_detections, limit_y, filename
+                ocr_image, code_locations, barcodes, limit_y, filename
             )
 
         return result
+
+    @staticmethod
+    def _rotation_angles(steps):
+        """
+        Genere les angles a tester, repartis uniformement sur 360 degres (0 inclus).
+        :param steps: nombre d'orientations (ex: 8 -> 0, 45, 90, ..., 315)
+        :return: liste d'angles en degres
+        """
+        steps = max(1, int(steps))
+        return [round(k * 360.0 / steps, 4) for k in range(steps)]
 
     def _run_ocr(self, image):
         """
@@ -147,9 +174,31 @@ class Extractor:
         return locations
 
     @staticmethod
+    def _reproject_barcodes(barcodes, angle, original_size, rotated_size):
+        """
+        Reprojette les contours des codes-barres trouves sur une image tournee
+        vers l'image d'origine (pour l'annotation a 0 degre).
+        :param barcodes: codes-barres [{"value","points",...}]
+        :param angle: angle de la passe (0 = pas de reprojection)
+        :param original_size: taille (w, h) de l'image d'origine
+        :param rotated_size: taille (w, h) de l'image tournee
+        :return: la liste des codes-barres (contours reprojetes si angle != 0)
+        """
+        if angle == 0:
+            return barcodes
+        for barcode in barcodes:
+            if barcode.get("points"):
+                barcode["points"] = ImageTransformer.rotate_points_back(
+                    barcode["points"], angle, original_size, rotated_size)
+        return barcodes
+
+    @staticmethod
     def _match_boxes(detections, reference_digits):
         """
-        Retrouve les boites des mots OCR qui composent un code.
+        Retrouve les boites des mots OCR qui composent un code. Le test est
+        bidirectionnel : on garde le mot si ses chiffres font partie de la reference
+        (ex: '7604' dans '76047536') OU si la reference est presente dans ses chiffres
+        (ex: '76047536' dans '7604753624400' quand Tesseract lit la designation entiere).
         :param detections: detections OCR [{"text","box"}]
         :param reference_digits: chiffres de la reference (base + complement)
         :return: liste de boites (x, y, w, h)
@@ -160,8 +209,7 @@ class Extractor:
             if not box:
                 continue
             digits = "".join(c for c in det["text"] if c.isdigit())
-            # Un mot compose le code si ses chiffres (au moins 3) en font partie.
-            if len(digits) >= 3 and digits in reference_digits:
+            if len(digits) >= 3 and (digits in reference_digits or reference_digits in digits):
                 boxes.append(box)
         return boxes
 
@@ -223,15 +271,6 @@ class Extractor:
             confidences = [c for c in (target["confidence"], info["confidence"]) if c is not None]
             target["confidence"] = max(confidences) if confidences else None
         return accumulator
-
-    @staticmethod
-    def _has_codes(article_codes):
-        """
-        Indique si au moins un code a ete detecte (decor ou cartouche).
-        :param article_codes: dictionnaire {"packaging": {...}, "cartouche": {...}}
-        :return: booleen
-        """
-        return bool(article_codes["packaging"] or article_codes["cartouche"])
 
     @staticmethod
     def _box_center_y(detection):

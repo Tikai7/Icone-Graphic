@@ -66,37 +66,39 @@ class DetectionPlotter:
 
     def _draw_codes(self, bgr, code_locations):
         """
-        Entoure chaque code localise et l'etiquette (zone + angle). Les codes non
-        localisables sont inscrits en haut de l'image.
+        Entoure chaque code localise et l'etiquette (zone + angle). Les codes
+        detectes mais sans position pointable sont resumes en haut de l'image
+        (statut : zone + valeur), dans la couleur de leur zone.
         :param bgr: image OpenCV (BGR) modifiee en place
         :param code_locations: localisations des codes
         :return: None
         """
-        unlocated = []
+        top_status = []
         for loc in code_locations:
             color = self.PACKAGING_COLOR if loc["zone"] == "PACKAGING" else self.CARTOUCHE_COLOR
             label = f"{loc['reference']} [{loc['zone']} @{loc['angle']}deg]"
             if loc["polygon"] is None:
-                unlocated.append(f"NON LOCALISE : {label} (x{loc['occurrences']})")
+                top_status.append((f"Detecte : {label} (x{loc['occurrences']})", color))
                 continue
             polygon = self.np.array(loc["polygon"], dtype=int).reshape(-1, 2)
             self.cv2.polylines(bgr, [polygon], True, color, 2)
             x, y = polygon[0]
             self.cv2.putText(bgr, label, (int(x), max(int(y) - 8, 15)),
                              self.cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        self._draw_top_labels(bgr, unlocated)
+        self._draw_top_labels(bgr, top_status)
 
     def _draw_top_labels(self, bgr, labels):
         """
-        Inscrit des libelles en haut de l'image (codes non localises).
+        Inscrit des libelles en haut de l'image (statut des detections), chacun
+        dans sa propre couleur de zone.
         :param bgr: image OpenCV (BGR) modifiee en place
-        :param labels: liste de textes a ecrire
+        :param labels: liste de tuples (texte, couleur_BGR)
         :return: None
         """
         y = 30
-        for label in labels:
+        for label, color in labels:
             self.cv2.putText(bgr, label, (10, y),
-                             self.cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.PACKAGING_COLOR, 2)
+                             self.cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             y += 32
 
     def _draw_barcodes(self, bgr, barcode_detections):

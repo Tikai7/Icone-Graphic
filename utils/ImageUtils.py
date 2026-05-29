@@ -60,6 +60,19 @@ class ImageTransformer:
                 for px, py in corners]
 
     @staticmethod
+    def rotate_points_back(points, angle, original_size, rotated_size):
+        """
+        Reprojette une liste de points de l'image tournee vers l'image d'origine.
+        :param points: liste de points [(x, y), ...] dans l'image tournee
+        :param angle: angle de rotation applique (degres)
+        :param original_size: taille (w, h) de l'image d'origine
+        :param rotated_size: taille (w, h) de l'image tournee
+        :return: liste de points [(x, y), ...] dans l'image d'origine
+        """
+        return [ImageTransformer._point_back(px, py, angle, original_size, rotated_size)
+                for px, py in points]
+
+    @staticmethod
     def _point_back(x, y, angle, original_size, rotated_size):
         """
         Reprojette un point de l'image tournee vers l'image d'origine.

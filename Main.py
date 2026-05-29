@@ -27,16 +27,18 @@ class ExtractionPipeline:
     .txt (lecture humaine) et un fichier .xml (exploitable par les flux ICONE).
     """
 
-    def __init__(self, engine, barcode_engine, config=Config, path=None):
+    def __init__(self, engine, barcode_engine, config=Config, path=None, rotation_steps=None):
         """
         :param engine: instance de moteur OCR a utiliser
         :param barcode_engine: instance de moteur de codes-barres a utiliser
         :param config: classe de configuration
         :param path: chemin a traiter (image, dossier d'images, ou dossier de
             sous-dossiers). Si None, on utilise le dataset defini dans Config.
+        :param rotation_steps: nombre d'orientations testees (defaut: Config.ROTATION_STEPS)
         """
         self.config = config
         self.path = self._resolve_path(path)
+        self.rotation_steps = rotation_steps
         self.base_dir = os.path.join(ROOT_DIR, config.BASE_DIR)
         output_dir = os.path.join(ROOT_DIR, config.OUTPUT_DIR)
         self.txt_writer = TxtResultWriter(output_dir)
@@ -47,7 +49,7 @@ class ExtractionPipeline:
         if config.SAVE_ANNOTATED_IMAGES:
             plotter = DetectionPlotter(os.path.join(output_dir, "annotated"), config.CARTOUCHE_Y_RATIO)
 
-        self.extractor = Extractor(engine, barcode_engine, config, plotter)
+        self.extractor = Extractor(engine, barcode_engine, config, plotter, self.rotation_steps)
 
     def run(self):
         """
@@ -195,6 +197,9 @@ def parse_args():
                         help="Moteur OCR (tesseract).")
     parser.add_argument("--barcode", default=Config.DEFAULT_BARCODE_ENGINE,
                         help="Moteur code-barres (pyzbar / opencv).")
+    parser.add_argument("--rotations", type=int, default=None,
+                        help=f"Nombre d'orientations testees (0 inclus). "
+                             f"Defaut: Config.ROTATION_STEPS ({Config.ROTATION_STEPS}).")
     return parser.parse_args()
 
 
@@ -206,5 +211,6 @@ if __name__ == "__main__":
     args = parse_args()
     ocr_engine = build_engine(args.ocr)
     barcode_engine = build_barcode_engine(args.barcode)
-    pipeline = ExtractionPipeline(ocr_engine, barcode_engine, path=args.path)
+    pipeline = ExtractionPipeline(ocr_engine, barcode_engine,
+                                  path=args.path, rotation_steps=args.rotations)
     pipeline.run()
