@@ -288,6 +288,10 @@ class Extractor:
     def _code_confidence(code, detections):
         """
         Estime la confiance d'un code a partir des mots OCR qui le composent.
+        Test bidirectionnel : un mot contribue si ses chiffres font partie du code
+        OU si le code est present dans ses chiffres (cas ou Tesseract lit toute la
+        designation d'un bloc, ex: '76064288_ETQFIL_..._2026_PT' -> chiffres
+        '760642882026' qui contient bien '76064288').
         :param code: code (base ou contracte) recherche
         :param detections: detections OCR [{"text","confidence",...}]
         :return: confiance moyenne (0-1) des mots correspondants, ou None
@@ -295,8 +299,7 @@ class Extractor:
         confidences = []
         for det in detections:
             digits = "".join(c for c in det["text"] if c.isdigit())
-            # Un mot contribue si ses chiffres (au moins 2) font partie du code.
-            if len(digits) >= 2 and digits in code:
+            if len(digits) >= 2 and (digits in code or code in digits):
                 confidences.append(det["confidence"])
         if not confidences:
             return None

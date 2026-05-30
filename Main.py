@@ -16,6 +16,7 @@ from Config import Config
 from Extractor import Extractor
 from OCREngines import TesseractEngine
 from Barecode import OpenCVBarcodeEngine, PyzbarBarcodeEngine
+from Analyzer import Analyzer
 from utils.OutputUtils import TxtResultWriter, XmlResultWriter
 from utils.PlotUtils import DetectionPlotter
 
@@ -62,14 +63,19 @@ class ExtractionPipeline:
         print("-" * 60)
 
         images = list(self._iter_images())
+        xml_paths = []
         for image_path in tqdm(images, desc="Extraction"):
             result = self.extractor.extract(image_path)
             self.txt_writer.write(result)
             xml_path = self.xml_writer.write(result)
+            xml_paths.append(xml_path)
             self._print_summary(result, xml_path)
 
         print("-" * 60)
         print(f"[INFO] Termine : {len(images)} image(s) traitee(s).")
+
+        # Analyse globale des sorties XML du run courant.
+        Analyzer().analyze(xml_paths)
 
     @staticmethod
     def _resolve_path(path):
@@ -200,6 +206,9 @@ def parse_args():
     parser.add_argument("--rotations", type=int, default=None,
                         help=f"Nombre d'orientations testees (0 inclus). "
                              f"Defaut: Config.ROTATION_STEPS ({Config.ROTATION_STEPS}).")
+    parser.add_argument("--analyze", default=None,
+                        help="Dossier contenant des XML d'extraction. Si fourni, on "
+                             "lance UNIQUEMENT l'analyse (pas d'extraction).")
     return parser.parse_args()
 
 
@@ -208,9 +217,16 @@ if __name__ == "__main__":
     #   python Main.py
     #   python Main.py --path data/dataset_ocr_packaging/lots_of_text/150_PPP/image.png
     #   python Main.py --path data/dataset_ocr_packaging --ocr tesseract --barcode pyzbar
+    #   python Main.py --analyze output       
+
     args = parse_args()
-    ocr_engine = build_engine(args.ocr)
-    barcode_engine = build_barcode_engine(args.barcode)
-    pipeline = ExtractionPipeline(ocr_engine, barcode_engine,
-                                  path=args.path, rotation_steps=args.rotations)
-    pipeline.run()
+
+    # Mode analyse seule : on parcourt les XML deja produits et on imprime les metriques.
+    if args.analyze:
+        Analyzer().analyze_folder(args.analyze)
+    else:
+        ocr_engine = build_engine(args.ocr)
+        barcode_engine = build_barcode_engine(args.barcode)
+        pipeline = ExtractionPipeline(ocr_engine, barcode_engine,
+                                      path=args.path, rotation_steps=args.rotations)
+        pipeline.run()

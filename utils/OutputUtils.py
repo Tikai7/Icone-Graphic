@@ -119,7 +119,8 @@ class XmlResultWriter:
         root = ET.Element("ExtractionResult")
         ET.SubElement(root, "FileName").text = result["file"]
         ET.SubElement(root, "Engine").text = result["engine"]
-        ET.SubElement(root, "ExpectedCode").text = str(result["expected_code"])
+        # Vide si pas de code attendu (None) : evite d'ecrire la chaine litterale "None".
+        ET.SubElement(root, "ExpectedCode").text = result["expected_code"] or ""
         ET.SubElement(root, "DetectedAngles").text = ", ".join(str(a) for a in result["detected_angles"])
         ET.SubElement(root, "MeanConfidence").text = str(result["mean_confidence"])
         ET.SubElement(root, "TextDetections").text = str(result["n_text_detections"])
