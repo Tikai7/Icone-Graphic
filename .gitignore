@@ -8,6 +8,7 @@
 
 # Sorties generees
 /output
+/output*
 
 # Python
 __pycache__/

@@ -19,14 +19,19 @@ class Config:
     # Chemin du binaire Tesseract (Windows). Mettre a None si deja dans le PATH.
     TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     TESSERACT_LANG = "fra+eng"
-    # PSM 3 lit mieux le decor que PSM 11
-    TESSERACT_CONFIG = r"--oem 3 --psm 3"
+    # PSM 12 : texte epars + detection d'orientation (OSD). Plus robuste aux
+    # rotations 90/270 deg que PSM 3, sans regression a 0 deg.
+    TESSERACT_CONFIG = r"--oem 3 --psm 12"
 
     # --- Moteur code-barres (pyzbar ou opencv)
     DEFAULT_BARCODE_ENGINE = "pyzbar"
 
-    # Pretraitement image 
-    USE_GRAYSCALE = False
+    # Si True et si la passe normale ne trouve AUCUN code packaging dans le decor,
+    # on rejoue les rotations sur le decor en appliquant le pretraitement
+    # (grayscale + CLAHE + unsharp mask). Utilise UNIQUEMENT en fallback : ce
+    # pretraitement ajoute du bruit qui peut deteriorer Tesseract quand l'image
+    # est deja bien contrastee.
+    DECOR_PREPROCESS_FALLBACK = True
 
     # Fraction de la hauteur separant le packaging/decor (haut) de la cartouche technique
     CARTOUCHE_Y_RATIO = 0.7

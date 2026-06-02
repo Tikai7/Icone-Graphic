@@ -74,6 +74,7 @@ class Analyzer:
             "file": root.findtext("FileName") or os.path.basename(xml_path),
             "expected": expected,
             "detected_angles": (root.findtext("DetectedAngles") or "").strip(),
+            "fallback_used": (root.findtext("FallbackUsed") or "").strip() == "True",
             "mean_ocr_confidence": self._float(root.findtext("MeanConfidence")),
         }
         for zone, xpath in self.ZONES.items():

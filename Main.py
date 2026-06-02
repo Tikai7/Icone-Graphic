@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from Config import Config
 from Extractor import Extractor
-from OCREngines import TesseractEngine
+from OCREngines import TesseractEngine, DoctrEngine
 from Barecode import OpenCVBarcodeEngine, PyzbarBarcodeEngine
 from Analyzer import Analyzer
 from utils.OutputUtils import TxtResultWriter, XmlResultWriter
@@ -23,12 +23,11 @@ from utils.PlotUtils import DetectionPlotter
 
 class ExtractionPipeline:
     """
-    Orchestrateur du POC (perimetre recadre : extraction uniquement).
-    Parcourt le dataset d'images rasterisees et produit, par image, un fichier
-    .txt (lecture humaine) et un fichier .xml (exploitable par les flux ICONE).
+    Parcourt le dataset d'images rasterisees et produit, par image, un fichier txt et xml des résultats.
     """
 
-    def __init__(self, engine, barcode_engine, config=Config, path=None, rotation_steps=None):
+    def __init__(self, engine, barcode_engine, config=Config, path=None,
+                 rotation_steps=None, output_dir=None):
         """
         :param engine: instance de moteur OCR a utiliser
         :param barcode_engine: instance de moteur de codes-barres a utiliser
@@ -36,12 +35,17 @@ class ExtractionPipeline:
         :param path: chemin a traiter (image, dossier d'images, ou dossier de
             sous-dossiers). Si None, on utilise le dataset defini dans Config.
         :param rotation_steps: nombre d'orientations testees (defaut: Config.ROTATION_STEPS)
+        :param output_dir: dossier de sortie (defaut: Config.OUTPUT_DIR)
         """
         self.config = config
         self.path = self._resolve_path(path)
         self.rotation_steps = rotation_steps
         self.base_dir = os.path.join(ROOT_DIR, config.BASE_DIR)
-        output_dir = os.path.join(ROOT_DIR, config.OUTPUT_DIR)
+        
+        output_dir = output_dir or config.OUTPUT_DIR
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(ROOT_DIR, output_dir)
+
         self.txt_writer = TxtResultWriter(output_dir)
         self.xml_writer = XmlResultWriter(output_dir)
 
@@ -163,7 +167,7 @@ class ExtractionPipeline:
 def build_engine(name):
     """
     Fabrique le moteur OCR demande.
-    :param name: nom du moteur ('tesseract')
+    :param name: nom du moteur ('tesseract' ou 'doctr')
     :return: instance d'un moteur OCR
     """
     if name == "tesseract":
@@ -172,6 +176,9 @@ def build_engine(name):
             config=Config.TESSERACT_CONFIG,
             tesseract_cmd=Config.TESSERACT_CMD,
         )
+    if name == "doctr":
+        return DoctrEngine()
+    
     raise ValueError(f"Moteur OCR inconnu : {name}")
 
 
@@ -200,15 +207,19 @@ def parse_args():
              "Par defaut : dataset defini dans Config.",
     )
     parser.add_argument("--ocr", default=Config.DEFAULT_ENGINE,
-                        help="Moteur OCR (tesseract).")
+                        help="Moteur OCR (tesseract / doctr).")
     parser.add_argument("--barcode", default=Config.DEFAULT_BARCODE_ENGINE,
                         help="Moteur code-barres (pyzbar / opencv).")
     parser.add_argument("--rotations", type=int, default=None,
                         help=f"Nombre d'orientations testees (0 inclus). "
                              f"Defaut: Config.ROTATION_STEPS ({Config.ROTATION_STEPS}).")
+    parser.add_argument("--output", default=None,
+                        help=f"Dossier de sortie pour les .txt / .xml / images annotees. "
+                             f"Defaut: Config.OUTPUT_DIR ({Config.OUTPUT_DIR}).")
     parser.add_argument("--analyze", default=None,
                         help="Dossier contenant des XML d'extraction. Si fourni, on "
                              "lance UNIQUEMENT l'analyse (pas d'extraction).")
+
     return parser.parse_args()
 
 
@@ -220,13 +231,13 @@ if __name__ == "__main__":
     #   python Main.py --analyze output       
 
     args = parse_args()
-
-    # Mode analyse seule : on parcourt les XML deja produits et on imprime les metriques.
+    # Crée le fichier analysis.csv uniquement
     if args.analyze:
         Analyzer().analyze_folder(args.analyze)
     else:
         ocr_engine = build_engine(args.ocr)
         barcode_engine = build_barcode_engine(args.barcode)
         pipeline = ExtractionPipeline(ocr_engine, barcode_engine,
-                                      path=args.path, rotation_steps=args.rotations)
+                                      path=args.path, rotation_steps=args.rotations,
+                                      output_dir=args.output)
         pipeline.run()

@@ -7,10 +7,8 @@ from utils.TextUtils import TextProcessor, TextExtractor
 
 class Extractor:
     """
-    Brique 1 - Extraction (perimetre recadre).
     Detecte le texte d'une image rasterisee via un moteur OCR puis y recherche
-    les codes (code article et GENCOD). Aucune validation metier ni comparaison
-    au referentiel n'est realisee ici : ces briques relevent de la phase 2.
+    les codes (code article et GENCOD).
     """
 
     def __init__(self, engine, barcode_engine, config=Config, plotter=None, rotation_steps=None):
@@ -35,63 +33,98 @@ class Extractor:
         """
         filename = os.path.basename(image_path)
         expected_code = TextExtractor.extract_expected_code_from_filename(filename)
+    
+        ocr_image = ImageLoader.load(image_path)
 
-        image = ImageLoader.load(image_path)
-        # Conversion en niveaux de gris optionnelle (desactivee par defaut).
-        ocr_image = ImagePreprocessor.to_grayscale(image) if self.config.USE_GRAYSCALE else image
-        limit_y = ocr_image.size[1] * self.config.CARTOUCHE_Y_RATIO
+        full_w, full_h = ocr_image.size
+        limit_y = int(full_h * self.config.CARTOUCHE_Y_RATIO)
+
+        # On decoupe l'image en deux zones decor / cartouche
+        decor_crop = ocr_image.crop((0, 0, full_w, limit_y))
+        cartouche_crop = ocr_image.crop((0, limit_y, full_w, full_h))
 
         article_codes = {"packaging": {}, "cartouche": {}}
         barcodes = []
         code_locations = []
         detected_angles = []
+        fallback_used = False  # Devient True si le repli preprocess a trouve le code packaging.
         full_text, mean_conf, n_detections = "", 0.0, 0
 
-        # On teste 0 degre puis les rotations (reparties uniformement sur 360),
-        # et on s'arrete des que le code packaging ET le code-barres sont trouves.
+        # Teste des rotations reparties uniformement sur 360
         angles = self._rotation_angles(self.rotation_steps) if self.config.TRY_ROTATIONS else [0]
+        print(f"[INFO] Testing angles: {angles}")
         for angle in angles:
-            rotated = ocr_image if angle == 0 else ImageTransformer.rotate(ocr_image, angle)
 
-            # --- Code article (OCR) ---
-            text, conf, detections = self._run_ocr(rotated)
+            decor_dets, decor_meta = self._ocr_zone(
+                decor_crop, angle,
+                preprocess=False,
+                zone_name="DECOR",
+            )
+            cartouche_dets, cartouche_meta = self._ocr_zone(cartouche_crop, angle)
+        
             if angle == 0:
-                # Passe de reference : on garde le texte/confiance et on separe les zones.
-                full_text, mean_conf, n_detections = text, conf, len(detections)
-                decor, cartouche = self._split_zones(detections, limit_y)
-                packaging = self._find_in_zone(decor, expected_code, allow_contracted=True) if expected_code else {}
-                cartouche_codes = self._find_in_zone(cartouche, expected_code, allow_contracted=False) if expected_code else {}
-                article_codes["packaging"] = self._merge_codes(article_codes["packaging"], packaging)
-                article_codes["cartouche"] = self._merge_codes(article_codes["cartouche"], cartouche_codes)
-                code_locations += self._locate(packaging, decor, "PACKAGING", 0, None, None)
-                code_locations += self._locate(cartouche_codes, cartouche, "CARTOUCHE", 0, None, None)
-                if packaging or cartouche_codes:
-                    detected_angles.append(0)
-            elif expected_code:
-                found = self._find_in_zone(detections, expected_code, allow_contracted=True)
-                if found:
-                    article_codes["packaging"] = self._merge_codes(article_codes["packaging"], found)
-                    code_locations += self._locate(found, detections, "PACKAGING", angle,
-                                                   ocr_image.size, rotated.size)
-                    detected_angles.append(angle)
+                full_text, mean_conf, n_detections = self._aggregate_pass(
+                    decor_dets, decor_meta, cartouche_dets, cartouche_meta
+                )
 
-            # --- Code-barres (bibliotheque), tant qu'on ne l'a pas encore trouve ---
+            # --- Recherche par zone : packaging / cartouche ---
+            if expected_code:
+                packaging = self._find_in_zone(decor_dets, expected_code, allow_contracted=True)
+                cartouche_codes = self._find_in_zone(cartouche_dets, expected_code, allow_contracted=False)
+            else:
+                packaging, cartouche_codes = {}, {}
+
+            article_codes["packaging"] = self._merge_codes(article_codes["packaging"], packaging)
+            article_codes["cartouche"] = self._merge_codes(article_codes["cartouche"], cartouche_codes)
+            code_locations += self._locate(packaging, decor_dets, "PACKAGING", angle,
+                                           decor_crop.size, decor_meta["rotated_size"],
+                                           offset=(0, 0))
+            code_locations += self._locate(cartouche_codes, cartouche_dets, "CARTOUCHE", angle,
+                                           cartouche_crop.size, cartouche_meta["rotated_size"],
+                                           offset=(0, limit_y))
+            if packaging or cartouche_codes:
+                detected_angles.append(angle)
+
+            # --- Code-barres : sur l'image COMPLETE (le crop pourrait couper un code) ---
             if not barcodes:
-                found_barcodes = self.barcode_engine.read(rotated)
+                rotated_full = ocr_image if angle == 0 else ImageTransformer.rotate(ocr_image, angle)
+                found_barcodes = self.barcode_engine.read(rotated_full)
                 if found_barcodes:
-                    barcodes = self._reproject_barcodes(found_barcodes, angle, ocr_image.size, rotated.size)
+                    barcodes = self._reproject_barcodes(found_barcodes, angle, ocr_image.size, rotated_full.size)
 
-            # --- Arret des que les deux cibles prioritaires sont trouvees :
-            # le code PACKAGING (decor) et le code-barres. Le code cartouche seul
-            # (toujours present, ce n'est pas la priorite) ne suffit pas a arreter.
+            # --- Arret des que les deux cibles prioritaires sont trouvees ---
             if article_codes["packaging"] and barcodes:
                 break
+
+        # --- Fallback preprocess : si aucun code packaging trouve, on rejoue les
+        # rotations sur le decor avec pretraitement (CLAHE + unsharp mask).
+        # On s'arrete au premier angle qui donne un hit pour limiter le cout. ---
+        if (self.config.DECOR_PREPROCESS_FALLBACK and expected_code
+                and not article_codes["packaging"]):
+            for angle in angles:
+                decor_dets, decor_meta = self._ocr_zone(
+                    decor_crop, angle,
+                    preprocess=True,
+                    zone_name="DECOR(fallback)",
+                )
+                packaging = self._find_in_zone(decor_dets, expected_code, allow_contracted=True)
+                if packaging:
+                    article_codes["packaging"] = self._merge_codes(article_codes["packaging"], packaging)
+                    code_locations += self._locate(
+                        packaging, decor_dets, "PACKAGING", angle,
+                        decor_crop.size, decor_meta["rotated_size"], offset=(0, 0),
+                    )
+                    if angle not in detected_angles:
+                        detected_angles.append(angle)
+                    fallback_used = True
+                    break
 
         result = {
             "file": filename,
             "engine": self.engine.__class__.__name__,
             "expected_code": expected_code,
             "detected_angles": detected_angles,
+            "fallback_used": fallback_used,
             "mean_confidence": round(mean_conf, 3),
             "n_text_detections": n_detections,
             "article_codes": article_codes,
@@ -131,30 +164,66 @@ class Extractor:
             mean_conf = 0.0
         return full_text, mean_conf, detections
 
-    def _split_zones(self, detections, limit_y):
+    def _ocr_zone(self, crop, angle, preprocess=False, zone_name=""):
         """
-        Separe les detections OCR entre le decor (haut) et la cartouche (bas).
-        :param detections: detections OCR [{"text","box"}]
-        :param limit_y: ordonnee separant le decor (haut) de la cartouche (bas)
-        :return: tuple (detections_decor, detections_cartouche)
+        OCR-ise un crop (avec preprocess et rotation optionnels).
+        :param crop: image PIL du crop (decor ou cartouche)
+        :param angle: angle de rotation
+        :param preprocess: si True, applique le pretraitement (CLAHE + unsharp mask)
+        :param zone_name: libelle de zone (pour debug)
+        :return: tuple (detections, meta) | meta = {"text","conf","rotated_size"} (pour reprojection)
         """
-        decor = [d for d in detections if self._box_center_y(d) < limit_y]
-        cartouche = [d for d in detections if self._box_center_y(d) >= limit_y]
-        return decor, cartouche
+        work = ImagePreprocessor.preprocess_for_ocr(crop) if preprocess else crop
+        rotated = work if angle == 0 else ImageTransformer.rotate(work, angle)
+        text, conf, detections = self._run_ocr(rotated)
 
-    def _locate(self, codes, zone_detections, zone, angle, original_size, rotated_size):
+        if zone_name == "DECOR":
+            pass
+            # import matplotlib.pyplot as plt
+            # plt.imshow(rotated)
+            # plt.title(f"Decor Crop - Angle {angle}°")
+            # plt.show()
+
+        meta = {
+            "text": text,
+            "conf": conf,
+            "rotated_size": None if angle == 0 else rotated.size,
+        }
+        return detections, meta
+
+    @staticmethod
+    def _aggregate_pass(decor_dets, decor_meta, cartouche_dets, cartouche_meta):
         """
-        Construit les localisations des codes d'une zone, sous forme de polygones
-        exprimes dans l'image d'origine (0 degre). Pour un angle non nul, les boites
-        trouvees sur l'image tournee sont reprojetees vers l'image d'origine.
+        Agrege les detections des deux zones d'une meme passe : texte concatene,
+        confiance moyenne globale (sur l'ensemble des mots) et nombre total de detections.
+        :param decor_dets: detections OCR du decor
+        :param decor_meta: meta de l'OCR decor ({"text","conf","rotated_size"})
+        :param cartouche_dets: detections OCR de la cartouche
+        :param cartouche_meta: meta de l'OCR cartouche
+        :return: tuple (full_text, mean_conf, n_text_detections)
+        """
+        full_text = " ".join(t for t in (decor_meta["text"], cartouche_meta["text"]) if t)
+        all_dets = decor_dets + cartouche_dets
+        confidences = [d["confidence"] for d in all_dets]
+        mean_conf = sum(confidences) / len(confidences) if confidences else 0.0
+        return full_text, mean_conf, len(all_dets)
+
+    def _locate(self, codes, zone_detections, zone, angle, crop_size, rotated_size, offset=(0, 0)):
+        """
+        Construit les localisations des codes d'une zone, en polygones exprimes
+        dans l'image d'origine 0 degre. Pipeline : boite dans le crop tourne
+        -> (reprojection angle) -> boite dans le crop 0 degre -> (offset)
+        -> polygone dans l'image originale 0 degre.
         :param codes: codes detectes {base: {"occurrences","complement",...}}
-        :param zone_detections: detections OCR de la passe concernee
+        :param zone_detections: detections OCR sur le crop tourne
         :param zone: libelle de zone ('PACKAGING' ou 'CARTOUCHE')
-        :param angle: angle de la passe (0 pour l'image d'origine)
-        :param original_size: taille (w, h) de l'image d'origine (None si angle 0)
-        :param rotated_size: taille (w, h) de l'image tournee (None si angle 0)
+        :param angle: angle de la passe (0 = pas de reprojection rotation)
+        :param crop_size: taille (w, h) du crop 0 degre
+        :param rotated_size: taille (w, h) du crop tourne (None si angle 0)
+        :param offset: translation (x, y) du crop 0 degre vers l'image originale
         :return: liste de {"reference","zone","angle","occurrences","polygon"}
         """
+        ox, oy = offset
         locations = []
         for base, info in codes.items():
             reference = base + (f"/{info['complement']}" if info["complement"] else "")
@@ -169,7 +238,8 @@ class Extractor:
                     x, y, w, h = box
                     polygon = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
                 else:
-                    polygon = ImageTransformer.rotate_box_back(box, angle, original_size, rotated_size)
+                    polygon = ImageTransformer.rotate_box_back(box, angle, crop_size, rotated_size)
+                polygon = [(p[0] + ox, p[1] + oy) for p in polygon]
                 locations.append({**common, "polygon": polygon})
         return locations
 
@@ -217,7 +287,7 @@ class Extractor:
         """
         Recherche le code article dans une zone (decor ou cartouche).
         Un code plus long que la base est decoupe en base + complement
-        (cas du code avec slash, ex: '76059533529' -> '76059533' + '529').
+        (ex: '76059533529' -> '76059533' + '529').
         :param zone_detections: detections OCR de la zone
         :param expected_code: code attendu issu du nom de fichier
         :param allow_contracted: autoriser le repli sur le code contracte (4 chiffres)
@@ -228,6 +298,14 @@ class Extractor:
         matches = TextExtractor.clean_matches(re.findall(pattern, normalized))
 
         if not matches:
+            # Repli n.1 : code coupe et lu DANS LE DESORDRE par l'OCR
+            # (ex: 76059129 -> Tesseract sort '9129' avant '7605' a cause d'un
+            # ordre de lecture etrange sur texte courbe ou multi-lignes).
+            split_value = self._find_split_pair(zone_detections, expected_code)
+            if split_value:
+                confidence = self._code_confidence(split_value, zone_detections)
+                return {split_value: {"occurrences": 1, "complement": "", "confidence": confidence}}
+            # Repli n.2 : code contracte (4 derniers chiffres seuls).
             if allow_contracted:
                 contracted = TextExtractor.search_contracted_code(normalized, expected_code)
                 if contracted:
@@ -248,6 +326,7 @@ class Extractor:
 
         for base, entry in codes.items():
             entry["confidence"] = self._code_confidence(base, zone_detections)
+
         return codes
 
     @staticmethod
@@ -272,17 +351,33 @@ class Extractor:
             target["confidence"] = max(confidences) if confidences else None
         return accumulator
 
+
     @staticmethod
-    def _box_center_y(detection):
+    def _find_split_pair(zone_detections, expected_code):
         """
-        Renvoie l'ordonnee du centre de la boite d'une detection (0 si absente).
-        :param detection: detection OCR {"box": (x, y, w, h)}
-        :return: ordonnee du centre de la boite
+        Cherche les 4 PREMIERS chiffres du code dans un mot OCR ET les 4 DERNIERS
+        dans un autre mot, sans contrainte d'ordre dans le texte. Sert quand OCR
+        coupe le code en deux morceaux et les lit dans n'importe quel ordre (texte
+        courbe, multi-lignes, etc.). Si les deux moities sont trouvees, on reconstitue
+        le code complet attendu.
+        :param zone_detections: detections OCR de la zone
+        :param expected_code: code attendu issu du nom de fichier
+        :return: le code complet si les deux moities sont trouvees, sinon None
         """
-        box = detection.get("box")
-        if not box:
-            return 0
-        return box[1] + box[3] / 2
+        if not expected_code or len(expected_code) < 8:
+            return None
+        first_half, second_half = expected_code[:4], expected_code[4:]
+        has_first = False
+        has_second = False
+        for det in zone_detections:
+            digits = "".join(c for c in det["text"] if c.isdigit())
+            if first_half in digits:
+                has_first = True
+            if second_half in digits:
+                has_second = True
+            if has_first and has_second:
+                return expected_code
+        return None
 
     @staticmethod
     def _code_confidence(code, detections):

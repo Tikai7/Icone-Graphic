@@ -1,6 +1,5 @@
 import re
 
-
 class TextProcessor:
     """Nettoyage et normalisation du texte OCR."""
 
@@ -12,7 +11,6 @@ class TextProcessor:
         :return: texte en majuscules
         """
         return text.upper()
-
 
 class TextExtractor:
     """Construction des regex et detection des codes dans le texte OCR."""
@@ -41,17 +39,37 @@ class TextExtractor:
     @staticmethod
     def extract_expected_code_from_filename(filename):
         """
-        Extrait le code attendu (76 + 6 chiffres) depuis le nom du fichier,
-        quelle que soit sa position dans le nom.
-        Ex: '241449-01_76059715_BARQ...' -> '76059715'
-        Ex: '76064923_BTE_PRIV_LABEL...'  -> '76064923'
+        Extrait le code attendu depuis le nom du fichier. 
+        Strategie :
+          1) on cherche d'abord le pattern standard '76' + 6 chiffres ;
+          2) sinon, on prend la plus longue chaine de chiffres consecutifs du nom.
         :param filename: nom du fichier image
         :return: code attendu (str) ou None
         """
-        # On utilise des lookarounds plutot que \b car l'underscore (frequent dans
-        # les noms de fichier) est considere comme un caractere de mot par \b.
+        return (
+            TextExtractor._find_76_plus_6(filename)
+            or TextExtractor._find_longest_digit_sequence(filename)
+        )
+
+    @staticmethod
+    def _find_76_plus_6(filename):
+        """
+        Strategie 1 : '76' suivi de 6 chiffres (cas principal).
+        :param filename: nom du fichier image
+        :return: code 8 chiffres trouve ou None
+        """
         match = re.search(r"(?<!\d)76\d{6}(?!\d)", filename)
         return match.group(0) if match else None
+
+    @staticmethod
+    def _find_longest_digit_sequence(filename):
+        """
+        Strategie 2 (fallback) : la plus longue chaine de chiffres consecutifs.
+        :param filename: nom du fichier image
+        :return: la plus longue chaine de chiffres ou None
+        """
+        digit_sequences = re.findall(r"\d+", filename)
+        return max(digit_sequences, key=len) if digit_sequences else None
 
     @staticmethod
     def search_contracted_code(text, expected_ref_code):

@@ -30,18 +30,51 @@ class ImagePreprocessor:
         return image.convert("L")
 
 
+    @staticmethod
+    def preprocess_for_ocr(image):
+        """
+        Pretraitement de l'image avant OCR :
+          - conversion en niveaux de gris ;
+          - CLAHE (egalisation d'histogramme locale) pour rehausser le contraste
+            sur des fonds inegaux / artworks colores ;
+          - unsharp mask pour accentuer les bords du texte fin.
+        Renvoie une image PIL en mode 'L'.
+        :param image: image PIL source
+        :return: image PIL pretraitee (mode 'L')
+        """
+        import cv2
+        import numpy as np
+
+        gray = np.array(image.convert("L"))
+
+        # CLAHE : ameliore le contraste localement sans saturer.
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
+        # Unsharp mask : (gray * 1.5) - (blurred * 0.5) accentue les bords du texte.
+        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5)
+        gray = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+
+        return Image.fromarray(gray)
+
+
 class ImageTransformer:
     """Transformations geometriques de l'image."""
 
     @staticmethod
     def rotate(image, angle):
         """
-        Fait pivoter l'image sans rogner les coins (expand=True).
+        Fait pivoter l'image sans rogner les coins (expand=True). Les coins crees
+        par la rotation sont remplis en BLANC plutot qu'en noir (defaut PIL) :
+        moins de contraste artificiel, Tesseract garde sa segmentation et son
+        auto-DPI proches du document original.
         :param image: image PIL source
         :param angle: angle de rotation en degres
         :return: nouvelle image PIL pivotee
         """
-        return image.rotate(angle, expand=True)
+        # 'L' (gris) attend un int, les modes couleurs un tuple de la bonne longueur.
+        fill = 255 if image.mode == "L" else (255,) * len(image.mode)
+        return image.rotate(angle, expand=True, fillcolor=fill)
 
     @staticmethod
     def rotate_box_back(box, angle, original_size, rotated_size):
