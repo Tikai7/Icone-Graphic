@@ -75,6 +75,7 @@ class Analyzer:
             "expected": expected,
             "detected_angles": (root.findtext("DetectedAngles") or "").strip(),
             "fallback_used": (root.findtext("FallbackUsed") or "").strip() == "True",
+            "processing_seconds": self._float(root.findtext("ProcessingSeconds")),
             "mean_ocr_confidence": self._float(root.findtext("MeanConfidence")),
         }
         for zone, xpath in self.ZONES.items():
@@ -193,6 +194,13 @@ class Analyzer:
                   f"extraction : {extraction_rate:.0%} | "
                   f"confiance moyenne : {conf_str}"
                   f"{cer_str}")
+        # Temps de traitement (sur le total, pas seulement les evaluables).
+        if "processing_seconds" in dataframe.columns:
+            times = dataframe["processing_seconds"].dropna()
+            if len(times):
+                print(f"  Temps moyen par image : {times.mean():.2f} s "
+                      f"| total : {times.sum():.1f} s "
+                      f"| mediane : {times.median():.2f} s")
         print("-" * 60)
         print(f"[ANALYSE] DataFrame sauvegarde : {csv_path}")
         print("-" * 60)

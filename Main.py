@@ -61,7 +61,7 @@ class ExtractionPipeline:
         Lance l'extraction sur tout le dataset et ecrit les resultats.
         :return: None
         """
-        print("[INFO] POC ICONE - Brique 1 : Extraction OCR (perimetre recadre)")
+        print("[INFO] POC ICONE : Extraction OCR")
         print(f"[INFO] Moteur OCR : {self.extractor.engine.__class__.__name__}")
         print(f"[INFO] Source : {self.path or self.base_dir}")
         print("-" * 60)

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 
 from Config import Config
 from utils.ImageUtils import ImageLoader, ImagePreprocessor, ImageTransformer
@@ -31,9 +32,10 @@ class Extractor:
         :param image_path: chemin de l'image rasterisee a traiter
         :return: dictionnaire de resultats d'extraction
         """
+        start_time = time.perf_counter()
         filename = os.path.basename(image_path)
         expected_code = TextExtractor.extract_expected_code_from_filename(filename)
-    
+
         ocr_image = ImageLoader.load(image_path)
 
         full_w, full_h = ocr_image.size
@@ -50,39 +52,43 @@ class Extractor:
         fallback_used = False  # Devient True si le repli preprocess a trouve le code packaging.
         full_text, mean_conf, n_detections = "", 0.0, 0
 
-        # Teste des rotations reparties uniformement sur 360
-        angles = self._rotation_angles(self.rotation_steps) if self.config.TRY_ROTATIONS else [0]
-        print(f"[INFO] Testing angles: {angles}")
-        for angle in angles:
+        # --- OCR cartouche : une seule fois a 0 degre ---
+        # La cartouche technique est TOUJOURS dessinee horizontalement dans le
+        # design des packagings. La tourner ne gagne rien et coute cher.
+        cartouche_dets, cartouche_meta = self._ocr_zone(cartouche_crop, angle=0)
+        cartouche_codes = (
+            self._find_in_zone(cartouche_dets, expected_code, allow_contracted=False)
+            if expected_code else {}
+        )
+        article_codes["cartouche"] = self._merge_codes(article_codes["cartouche"], cartouche_codes)
+        code_locations += self._locate(cartouche_codes, cartouche_dets, "CARTOUCHE", 0,
+                                       cartouche_crop.size, cartouche_meta["rotated_size"],
+                                       offset=(0, limit_y))
+        if cartouche_codes:
+            detected_angles.append(0)
 
+        # --- OCR decor : boucle sur les rotations (le packaging peut etre tourne) ---
+        angles = self._rotation_angles(self.rotation_steps) if self.config.TRY_ROTATIONS else [0]
+        decor_dets_at_0 = None  # garde la passe 0 deg pour l'agregation finale
+        decor_meta_at_0 = None
+        for angle in angles:
             decor_dets, decor_meta = self._ocr_zone(
                 decor_crop, angle,
                 preprocess=False,
                 zone_name="DECOR",
             )
-            cartouche_dets, cartouche_meta = self._ocr_zone(cartouche_crop, angle)
-        
             if angle == 0:
-                full_text, mean_conf, n_detections = self._aggregate_pass(
-                    decor_dets, decor_meta, cartouche_dets, cartouche_meta
-                )
+                decor_dets_at_0, decor_meta_at_0 = decor_dets, decor_meta
 
-            # --- Recherche par zone : packaging / cartouche ---
-            if expected_code:
-                packaging = self._find_in_zone(decor_dets, expected_code, allow_contracted=True)
-                cartouche_codes = self._find_in_zone(cartouche_dets, expected_code, allow_contracted=False)
-            else:
-                packaging, cartouche_codes = {}, {}
-
+            packaging = (
+                self._find_in_zone(decor_dets, expected_code, allow_contracted=True)
+                if expected_code else {}
+            )
             article_codes["packaging"] = self._merge_codes(article_codes["packaging"], packaging)
-            article_codes["cartouche"] = self._merge_codes(article_codes["cartouche"], cartouche_codes)
             code_locations += self._locate(packaging, decor_dets, "PACKAGING", angle,
                                            decor_crop.size, decor_meta["rotated_size"],
                                            offset=(0, 0))
-            code_locations += self._locate(cartouche_codes, cartouche_dets, "CARTOUCHE", angle,
-                                           cartouche_crop.size, cartouche_meta["rotated_size"],
-                                           offset=(0, limit_y))
-            if packaging or cartouche_codes:
+            if packaging and angle not in detected_angles:
                 detected_angles.append(angle)
 
             # --- Code-barres : sur l'image COMPLETE (le crop pourrait couper un code) ---
@@ -96,12 +102,26 @@ class Extractor:
             if article_codes["packaging"] and barcodes:
                 break
 
-        # --- Fallback preprocess : si aucun code packaging trouve, on rejoue les
-        # rotations sur le decor avec pretraitement (CLAHE + unsharp mask).
+        # Agregation finale (texte / confiance / nb detections) basee sur la passe 0 deg
+        full_text, mean_conf, n_detections = self._aggregate_pass(
+            decor_dets_at_0 or [], decor_meta_at_0 or {"text": "", "conf": 0.0},
+            cartouche_dets, cartouche_meta,
+        )
+
+        # --- Fallback : si aucun code packaging trouve, on rejoue le decor avec
+        # pretraitement (CLAHE + unsharp mask) sur une GRILLE PLUS FINE d'angles
+        # (ROTATION_STEPS_FALLBACK, typiquement 16) pour rattraper les codes
+        # tangents (ex: texte courbe lisible seulement a 292.5 deg). On ne
+        # re-teste pas les angles deja couverts par la passe normale.
         # On s'arrete au premier angle qui donne un hit pour limiter le cout. ---
         if (self.config.DECOR_PREPROCESS_FALLBACK and expected_code
                 and not article_codes["packaging"]):
-            for angle in angles:
+            fallback_angles = self._rotation_angles(self.config.ROTATION_STEPS_FALLBACK)
+            # On commence par les nouveaux angles, mais on garde les autres en filet
+            # (preprocess peut faire la difference meme sur un angle deja teste).
+            already_tried = set(angles)
+            fallback_angles = [a for a in fallback_angles if a not in already_tried] + list(angles)
+            for angle in fallback_angles:
                 decor_dets, decor_meta = self._ocr_zone(
                     decor_crop, angle,
                     preprocess=True,
@@ -125,6 +145,7 @@ class Extractor:
             "expected_code": expected_code,
             "detected_angles": detected_angles,
             "fallback_used": fallback_used,
+            "processing_seconds": round(time.perf_counter() - start_time, 3),
             "mean_confidence": round(mean_conf, 3),
             "n_text_detections": n_detections,
             "article_codes": article_codes,

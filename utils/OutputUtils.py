@@ -40,6 +40,7 @@ class TxtResultWriter:
             f"Code recherche     : {result['expected_code']}  (issu du nom de fichier)",
             f"Angles avec code   : {result['detected_angles']}",
             f"Fallback preprocess: {result.get('fallback_used', False)}",
+            f"Temps (s)          : {result.get('processing_seconds', 0)}",
             f"Confiance moyenne  : {result['mean_confidence']}",
             f"Detections texte   : {result['n_text_detections']}",
             "",
@@ -123,6 +124,7 @@ class XmlResultWriter:
         ET.SubElement(root, "ExpectedCode").text = result["expected_code"] or ""
         ET.SubElement(root, "DetectedAngles").text = ", ".join(str(a) for a in result["detected_angles"])
         ET.SubElement(root, "FallbackUsed").text = str(result.get("fallback_used", False))
+        ET.SubElement(root, "ProcessingSeconds").text = str(result.get("processing_seconds", 0))
         ET.SubElement(root, "MeanConfidence").text = str(result["mean_confidence"])
         ET.SubElement(root, "TextDetections").text = str(result["n_text_detections"])
 

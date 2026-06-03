@@ -28,10 +28,14 @@ class Config:
 
     # Si True et si la passe normale ne trouve AUCUN code packaging dans le decor,
     # on rejoue les rotations sur le decor en appliquant le pretraitement
-    # (grayscale + CLAHE + unsharp mask). Utilise UNIQUEMENT en fallback : ce
-    # pretraitement ajoute du bruit qui peut deteriorer Tesseract quand l'image
-    # est deja bien contrastee.
+    # (grayscale + CLAHE + unsharp mask) ET sur une grille plus fine d'angles
+    # (ROTATION_STEPS_FALLBACK). Utilise UNIQUEMENT en fallback : ce pretraitement
+    # ajoute du bruit qui peut deteriorer Tesseract quand l'image est deja bien
+    # contrastee, et la grille fine est plus couteuse.
     DECOR_PREPROCESS_FALLBACK = True
+    # Nombre d'orientations testees DANS LE FALLBACK uniquement (typiquement plus
+    # eleve que ROTATION_STEPS pour rattraper les codes tangents type 292.5 deg).
+    ROTATION_STEPS_FALLBACK = 16
 
     # Fraction de la hauteur separant le packaging/decor (haut) de la cartouche technique
     CARTOUCHE_Y_RATIO = 0.7
